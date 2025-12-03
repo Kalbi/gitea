@@ -167,3 +167,94 @@ func paymentsBaseURL() string {
 	return setting.CfgProvider.Section("payments").Key("SIDECAR_URL").MustString("http://payments:9000")
 }
 
+type checkoutResponse struct {
+	CheckoutURL    string `json:"checkout_url"`
+	SessionID      string `json:"session_id"`
+	CustomerID     string `json:"customer_id"`
+	SubscriptionID string `json:"subscription_id"`
+	ExpiresAt      int64  `json:"expires_at"`
+}
+
+type checkoutStatus struct {
+	SessionID      string `json:"session_id"`
+	Status         string `json:"status"`
+	CustomerID     string `json:"customer_id"`
+	SubscriptionID string `json:"subscription_id"`
+	PaymentStatus  string `json:"payment_status"`
+	ExpiresAt      int64  `json:"expires_at"`
+}
+
+func fetchCheckoutStatus(ctx *context.Context, sessionID string) (string, bool, string) {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/billing/session/%s", paymentsBaseURL(), url.PathEscape(sessionID)), nil)
+	if err != nil {
+		log.Warn("checkout status request build failed: %v", err)
+		return err.Error(), false, ""
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Warn("checkout status request error: %v", err)
+		return err.Error(), false, ""
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		log.Warn("checkout status http error: %s", resp.Status)
+		return fmt.Sprintf("status %s", resp.Status), false, ""
+	}
+
+	var st checkoutStatus
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		log.Warn("checkout status decode error: %v", err)
+		return err.Error(), false, ""
+	}
+	paid := st.Status == "complete" || st.PaymentStatus == "paid"
+	log.Info("checkout status: paid=%v session=%s status=%s payment_status=%s customer=%s subscription=%s", paid, st.SessionID, st.Status, st.PaymentStatus, st.CustomerID, st.SubscriptionID)
+	return fmt.Sprintf("%s/%s", st.Status, st.PaymentStatus), paid, st.SubscriptionID
+}
+
+func createCheckoutForOrg(ctx *context.Context, form *forms.CreateOrgForm) (string, error) {
+	// TODO: extract payments client/helpers to a separate package (e.g., services/payments) to avoid bloating org handlers.
+	payload := map[string]any{
+		"org_id":   form.OrgName,
+		"org_name": form.OrgName,
+		"quantity": 1,
+		"success_url": fmt.Sprintf(
+			"%sorg/create?org_name=%s&checkout_session_id={CHECKOUT_SESSION_ID}",
+			setting.AppURL, url.QueryEscape(form.OrgName),
+		),
+		"cancel_url": fmt.Sprintf(
+			"%sorg/create?org_name=%s&checkout_session_id={CHECKOUT_SESSION_ID}&canceled=1",
+			setting.AppURL, url.QueryEscape(form.OrgName),
+		),
+	}
+
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/billing/org/%s/checkout", paymentsBaseURL(), url.PathEscape(form.OrgName)), bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("checkout request failed: %s", resp.Status)
+	}
+
+	var out checkoutResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if out.CheckoutURL == "" {
+		return "", fmt.Errorf("missing checkout_url in response")
+	}
+	// Prefill billing token for return flows
+	ctx.Session.Set("checkout_session_id", out.SessionID)
+	ctx.Session.Set("checkout_url", out.CheckoutURL)
+	ctx.Data["billing_token"] = out.SessionID
+	return out.CheckoutURL, nil
+}
