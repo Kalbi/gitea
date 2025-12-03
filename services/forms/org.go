@@ -26,6 +26,9 @@ type CreateOrgForm struct {
 	OrgName                   string `binding:"Required;Username;MaxSize(40)" locale:"org.org_name_holder"`
 	Visibility                structs.VisibleType
 	RepoAdminChangeTeamAccess bool
+	// BillingToken is a placeholder for proof-of-payment (currently the Stripe Checkout session id);
+	// in a fuller implementation we should persist the subscription id
+	BillingToken string `form:"billing_token" binding:"MaxSize(255)"`
 }
 
 // Validate validates the fields
