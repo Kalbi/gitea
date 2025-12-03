@@ -40,9 +40,37 @@
 					</div>
 				</div>
 
+				<div class="ui tiny message">
+					PaywallEnabled={{.PaywallEnabled}} | PaymentCompleted={{.PaymentCompleted}}
+				</div>
+
+				{{if .PaywallEnabled}}
+					<div class="ui warning message">
+						<strong>Paywall debug:</strong>
+						<span>PaywallEnabled={{.PaywallEnabled}}</span>
+						<span>Status={{.CheckoutStatus}}</span>
+						<span>PaymentCompleted={{.PaymentCompleted}}</span>
+						<span>HasActiveSubscription={{.HasActiveSubscription}}</span>
+					</div>
+					{{if .HasActiveSubscription}}
+						<div class="ui positive message">
+							{{ctx.Locale.Tr "org.form.payment_modal_confirm"}}
+						</div>
+					{{else}}
+						<div class="inline field">
+							<label>{{ctx.Locale.Tr "org.form.payment_modal_title"}}</label>
+							<button class="ui button" type="submit" name="generate_checkout" value="1">{{ctx.Locale.Tr "org.form.payment_start_checkout"}}</button>
+							{{if .CheckoutURL}}
+								<a class="ui button" href="{{.CheckoutURL}}" rel="noopener noreferrer">{{ctx.Locale.Tr "org.form.payment_resume_checkout"}}</a>
+							{{end}}
+							<input type="hidden" id="billing_token" name="billing_token" value="{{.billing_token}}">
+						</div>
+					{{end}}
+				{{end}}
+
 				<div class="inline field">
 					<label></label>
-					<button class="ui primary button">
+					<button class="ui primary button" {{if and .PaywallEnabled (not .HasActiveSubscription)}}disabled{{end}}>
 						{{ctx.Locale.Tr "org.create_org"}}
 					</button>
 				</div>
