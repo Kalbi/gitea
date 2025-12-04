@@ -41,7 +41,7 @@
 				</div>
 
 				<div class="ui tiny message">
-					PaywallEnabled={{.PaywallEnabled}} | PaymentCompleted={{.PaymentCompleted}}
+					PaywallEnabled={{.PaywallEnabled}} | PaymentCompleted={{.PaymentCompleted}} | HasActiveSubscription={{.HasActiveSubscription}}
 				</div>
 
 				{{if .PaywallEnabled}}
@@ -64,6 +64,7 @@
 								<a class="ui button" href="{{.CheckoutURL}}" rel="noopener noreferrer">{{ctx.Locale.Tr "org.form.payment_resume_checkout"}}</a>
 							{{end}}
 							<input type="hidden" id="billing_token" name="billing_token" value="{{.billing_token}}">
+							<p class="help">Billing is per-organization. This PoC doesn’t auto-reuse an existing subscription; start a checkout for each new org.</p>
 						</div>
 					{{end}}
 				{{end}}
