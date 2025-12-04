@@ -116,18 +116,17 @@ func BillingPortal(ctx *context.Context) {
 		ctx.ServerError("GetOrgBilling", err)
 		return
 	}
-	if ob == nil || ob.CustomerID == "" {
-		ctx.Flash.Error("No billing customer found for this organization")
-		ctx.Redirect(ctx.Org.OrgLink + "/settings")
-		return
-	}
-
 	customerID := ob.CustomerID
 	if customerID == "" && ob.SubscriptionID != "" {
 		if sub, err := fetchSubscription(ctx, ob.SubscriptionID); err == nil && sub != nil && sub.Customer != "" {
+			log.Info("BillingPortal: fetched subscription %s with customer %s for org_id=%d", ob.SubscriptionID, sub.Customer, org.ID)
 			customerID = sub.Customer
 			ob.CustomerID = sub.Customer
 			_ = organization.UpsertOrgBilling(ctx, ob)
+		} else if err != nil {
+			log.Warn("BillingPortal: fetchSubscription failed sub_id=%s org_id=%d: %v", ob.SubscriptionID, org.ID, err)
+		} else {
+			log.Warn("BillingPortal: subscription has no customer sub_id=%s org_id=%d", ob.SubscriptionID, org.ID)
 		}
 	}
 	if customerID == "" {
