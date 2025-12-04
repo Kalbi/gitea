@@ -124,12 +124,17 @@ func CreatePost(ctx *context.Context) {
 		return
 	}
 
-	hasSub := ctx.Data["HasActiveSubscription"].(bool)
+	hasSub := false
+	if v, ok := ctx.Data["HasActiveSubscription"].(bool); ok {
+		hasSub = v
+	}
 
 	if isPaywallEnabled() && ctx.Req.FormValue("generate_checkout") == "1" {
 		checkoutURL, err := createCheckoutForOrg(ctx, &form)
 		if err != nil {
-			ctx.ServerError("CreateCheckoutSession", err)
+			log.Warn("CreateCheckoutSession failed: %v", err)
+			ctx.Flash.Error(ctx.Tr("org.form.payment_generate_failed"))
+			ctx.Redirect(ctx.Link)
 			return
 		}
 		ctx.Redirect(checkoutURL)
