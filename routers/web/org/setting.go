@@ -22,8 +22,8 @@ import (
 	repo_module "code.gitea.io/gitea/modules/repository"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/modules/templates"
+	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/modules/util"
 	"code.gitea.io/gitea/modules/web"
 	shared_user "code.gitea.io/gitea/routers/web/shared/user"
@@ -42,14 +42,6 @@ const (
 	// tplSettingsLabels template path for render labels settings
 	tplSettingsLabels templates.TplName = "org/settings/labels"
 )
-
-type subscriptionSummary struct {
-	ID               string `json:"id"`
-	Status           string `json:"status"`
-	Quantity         int    `json:"quantity"`
-	Customer         string `json:"customer"`
-	CurrentPeriodEnd int64  `json:"current_period_end"`
-}
 
 // Settings render the main settings page
 func Settings(ctx *context.Context) {
@@ -256,29 +248,6 @@ func SyncSeats(ctx *context.Context) {
 
 	ctx.Flash.Success(fmt.Sprintf("Synced seats to %d", seatCount))
 	ctx.Redirect(ctx.Org.OrgLink + "/settings")
-}
-
-func fetchSubscription(ctx *context.Context, subscriptionID string) (*subscriptionSummary, error) {
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/billing/subscription/%s", paymentsBaseURL(), url.PathEscape(subscriptionID)), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		return nil, fmt.Errorf("status %s", resp.Status)
-	}
-
-	var out subscriptionSummary
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	return &out, nil
 }
 
 // loadOrgBillingSummary populates billing-related data for the settings template.
