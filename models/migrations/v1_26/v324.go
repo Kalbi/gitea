@@ -14,14 +14,11 @@ type orgBilling struct {
 	CheckoutSessionID string
 	LastSeatCount     int
 	LastSync          timeutil.TimeStamp `xorm:"INDEX"`
+	CreatedUnix       timeutil.TimeStamp `xorm:"created"`
+	UpdatedUnix       timeutil.TimeStamp `xorm:"updated"`
 }
 
-func init() {
-	Register(Migration{
-		Title:   "add org billing table",
-		Version: 324,
-		Migrate: func(x *xorm.Engine) error {
-			return x.Sync(new(orgBilling))
-		},
-	})
+// AddOrgBillingTable creates the org billing table for subscriptions.
+func AddOrgBillingTable(x *xorm.Engine) error {
+	return x.Sync(new(orgBilling))
 }
