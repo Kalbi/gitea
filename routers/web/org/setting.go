@@ -5,10 +5,14 @@
 package org
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 
 	"code.gitea.io/gitea/models/db"
+	"code.gitea.io/gitea/models/organization"
 	packages_model "code.gitea.io/gitea/models/packages"
 	repo_model "code.gitea.io/gitea/models/repo"
 	user_model "code.gitea.io/gitea/models/user"
@@ -18,6 +22,7 @@ import (
 	repo_module "code.gitea.io/gitea/modules/repository"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/modules/templates"
 	"code.gitea.io/gitea/modules/util"
 	"code.gitea.io/gitea/modules/web"
@@ -96,6 +101,67 @@ func SettingsPost(ctx *context.Context) {
 
 	log.Trace("Organization setting updated: %s", org.Name)
 	ctx.Flash.Success(ctx.Tr("org.settings.update_setting_success"))
+	ctx.Redirect(ctx.Org.OrgLink + "/settings")
+}
+
+// SyncSeats recomputes billable seats for the org and pushes the quantity to the payments sidecar.
+func SyncSeats(ctx *context.Context) {
+	org := ctx.Org.Organization
+
+	ob, err := organization.GetOrgBilling(ctx, org.ID)
+	if err != nil {
+		ctx.ServerError("GetOrgBilling", err)
+		return
+	}
+	if ob == nil || ob.SubscriptionID == "" {
+		ctx.Flash.Error("No subscription found to sync seats")
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	memberIDs, err := organization.GetWriteMembersIDs(ctx, org.ID)
+	if err != nil {
+		log.Error("GetWriteMembersIDs org_id=%d: %v", org.ID, err)
+		ctx.Flash.Error("Failed to compute seat count")
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+	seatCount := len(memberIDs)
+
+	body, err := json.Marshal(map[string]int{"quantity": seatCount})
+	if err != nil {
+		ctx.ServerError("MarshalSyncSeatsPayload", err)
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/billing/subscription/%s/quantity", paymentsBaseURL(), url.PathEscape(ob.SubscriptionID)), bytes.NewReader(body))
+	if err != nil {
+		ctx.ServerError("SyncSeatsRequest", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		ctx.Flash.Error(fmt.Sprintf("Failed to sync seats: %v", err))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		ctx.Flash.Error(fmt.Sprintf("Failed to sync seats: %s", resp.Status))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	ob.LastSeatCount = seatCount
+	ob.LastSync = timeutil.TimeStampNow()
+	if err := organization.UpsertOrgBilling(ctx, ob); err != nil {
+		log.Warn("UpsertOrgBilling sync seats org_id=%d: %v", org.ID, err)
+	}
+
+	ctx.Flash.Success(fmt.Sprintf("Synced seats to %d", seatCount))
 	ctx.Redirect(ctx.Org.OrgLink + "/settings")
 }
 
