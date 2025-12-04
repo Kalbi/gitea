@@ -46,9 +46,11 @@ func Create(ctx *context.Context) {
 	ctx.Data["CheckoutURL"] = ""
 	ctx.Data["HasActiveSubscription"] = false
 	ctx.Data["ActiveSubscriptionID"] = ""
+	ctx.Data["ActiveCustomerID"] = ""
 	// NOTE: ctx.Data is where template fetches data; this block is temporary scaffolding.
 	// Eventually push paywall/session state handling into a dedicated helper/service
-	// TODO: load persisted billing info (OrgBilling) and reduce reliance on session
+	// TODO: add a pending checkout table keyed by CheckoutSessionID (org_name/customer/subscription)
+	// and transfer to OrgBilling after org creation to reduce reliance on session
 
 	// reuse session if present, allow resume
 	sessionID := ctx.FormString("checkout_session_id")
@@ -66,9 +68,12 @@ func Create(ctx *context.Context) {
 		ctx.Data["HasActiveSubscription"] = true
 		ctx.Data["ActiveSubscriptionID"] = subID
 	}
+	if custID, ok := ctx.Session.Get("customer_id").(string); ok && custID != "" {
+		ctx.Data["ActiveCustomerID"] = custID
+	}
 
 	if sessionID != "" {
-		status, paid, subID := fetchCheckoutStatus(ctx, sessionID)
+		status, paid, subID, custID := fetchCheckoutStatus(ctx, sessionID)
 		ctx.Data["CheckoutStatus"] = status
 		if paid {
 			ctx.Data["PaymentCompleted"] = true
@@ -76,6 +81,10 @@ func Create(ctx *context.Context) {
 			ctx.Data["HasActiveSubscription"] = true
 			ctx.Data["ActiveSubscriptionID"] = subID
 			ctx.Session.Set("subscription_id", subID)
+			if custID != "" {
+				ctx.Data["ActiveCustomerID"] = custID
+				ctx.Session.Set("customer_id", custID)
+			}
 		} else {
 			ctx.Data["billing_token"] = sessionID
 		}
@@ -96,9 +105,13 @@ func CreatePost(ctx *context.Context) {
 	ctx.Data["org_name"] = form.OrgName
 	ctx.Data["visibility"] = form.Visibility
 	ctx.Data["repo_admin_change_team_access"] = form.RepoAdminChangeTeamAccess
+	ctx.Data["ActiveCustomerID"] = ""
 	if subID, ok := ctx.Session.Get("subscription_id").(string); ok && subID != "" {
 		ctx.Data["HasActiveSubscription"] = true
 		ctx.Data["ActiveSubscriptionID"] = subID
+	}
+	if custID, ok := ctx.Session.Get("customer_id").(string); ok && custID != "" {
+		ctx.Data["ActiveCustomerID"] = custID
 	}
 
 	if !ctx.Doer.CanCreateOrganization() {
@@ -160,10 +173,12 @@ func CreatePost(ctx *context.Context) {
 	if isPaywallEnabled() {
 		subID, _ := ctx.Data["ActiveSubscriptionID"].(string)
 		sessionID, _ := ctx.Data["billing_token"].(string)
+		custID, _ := ctx.Data["ActiveCustomerID"].(string)
 		if subID != "" || sessionID != "" {
 			_ = organization.UpsertOrgBilling(ctx, &organization.OrgBilling{
 				OrgID:             org.ID,
 				SubscriptionID:    subID,
+				CustomerID:        custID,
 				CheckoutSessionID: sessionID,
 			})
 		}
@@ -268,6 +283,9 @@ func createCheckoutForOrg(ctx *context.Context, form *forms.CreateOrgForm) (stri
 	// Prefill billing token for return flows
 	ctx.Session.Set("checkout_session_id", out.SessionID)
 	ctx.Session.Set("checkout_url", out.CheckoutURL)
+	if out.CustomerID != "" {
+		ctx.Session.Set("customer_id", out.CustomerID)
+	}
 	ctx.Data["billing_token"] = out.SessionID
 	return out.CheckoutURL, nil
 }
