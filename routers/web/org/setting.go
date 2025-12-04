@@ -43,6 +43,14 @@ const (
 	tplSettingsLabels templates.TplName = "org/settings/labels"
 )
 
+type subscriptionSummary struct {
+	ID               string `json:"id"`
+	Status           string `json:"status"`
+	Quantity         int    `json:"quantity"`
+	Customer         string `json:"customer"`
+	CurrentPeriodEnd int64  `json:"current_period_end"`
+}
+
 // Settings render the main settings page
 func Settings(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("org.settings")
@@ -51,6 +59,8 @@ func Settings(ctx *context.Context) {
 	ctx.Data["CurrentVisibility"] = ctx.Org.Organization.Visibility
 	ctx.Data["RepoAdminChangeTeamAccess"] = ctx.Org.Organization.RepoAdminChangeTeamAccess
 	ctx.Data["ContextUser"] = ctx.ContextUser
+
+	loadOrgBillingSummary(ctx)
 
 	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
 		ctx.ServerError("RenderUserOrgHeader", err)
@@ -62,6 +72,7 @@ func Settings(ctx *context.Context) {
 
 // SettingsPost response for settings change submitted
 func SettingsPost(ctx *context.Context) {
+	loadOrgBillingSummary(ctx)
 	form := web.GetForm(ctx).(*forms.UpdateOrgSettingForm)
 	ctx.Data["Title"] = ctx.Tr("org.settings")
 	ctx.Data["PageIsOrgSettings"] = true
@@ -102,6 +113,88 @@ func SettingsPost(ctx *context.Context) {
 	log.Trace("Organization setting updated: %s", org.Name)
 	ctx.Flash.Success(ctx.Tr("org.settings.update_setting_success"))
 	ctx.Redirect(ctx.Org.OrgLink + "/settings")
+}
+
+// BillingPortal generates a Stripe customer portal URL and redirects the org owner there.
+func BillingPortal(ctx *context.Context) {
+	org := ctx.Org.Organization
+
+	ob, err := organization.GetOrgBilling(ctx, org.ID)
+	if err != nil {
+		ctx.ServerError("GetOrgBilling", err)
+		return
+	}
+	if ob == nil || ob.CustomerID == "" {
+		ctx.Flash.Error("No billing customer found for this organization")
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	customerID := ob.CustomerID
+	if customerID == "" && ob.SubscriptionID != "" {
+		if sub, err := fetchSubscription(ctx, ob.SubscriptionID); err == nil && sub != nil && sub.Customer != "" {
+			customerID = sub.Customer
+			ob.CustomerID = sub.Customer
+			_ = organization.UpsertOrgBilling(ctx, ob)
+		}
+	}
+	if customerID == "" {
+		ctx.Flash.Error("No billing customer found for this organization")
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	payload := map[string]string{
+		"customer_id": customerID,
+		"return_url":  fmt.Sprintf("%sorg/%s/settings", setting.AppURL, url.PathEscape(org.Name)),
+	}
+	if ob.SubscriptionID != "" {
+		payload["subscription_id"] = ob.SubscriptionID
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		ctx.ServerError("MarshalPortalPayload", err)
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/billing/portal", paymentsBaseURL()), bytes.NewReader(body))
+	if err != nil {
+		ctx.ServerError("BillingPortalRequest", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		ctx.Flash.Error(fmt.Sprintf("Failed to generate billing portal: %v", err))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		ctx.Flash.Error(fmt.Sprintf("Failed to generate billing portal: %s", resp.Status))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	var out struct {
+		PortalURL string `json:"portal_url"`
+		ID        string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		ctx.Flash.Error(fmt.Sprintf("Failed to parse billing portal response: %v", err))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+	if out.PortalURL == "" {
+		ctx.Flash.Error("Failed to generate billing portal: missing URL")
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	ctx.Redirect(out.PortalURL)
 }
 
 // SyncSeats recomputes billable seats for the org and pushes the quantity to the payments sidecar.
@@ -163,6 +256,69 @@ func SyncSeats(ctx *context.Context) {
 
 	ctx.Flash.Success(fmt.Sprintf("Synced seats to %d", seatCount))
 	ctx.Redirect(ctx.Org.OrgLink + "/settings")
+}
+
+func fetchSubscription(ctx *context.Context, subscriptionID string) (*subscriptionSummary, error) {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/billing/subscription/%s", paymentsBaseURL(), url.PathEscape(subscriptionID)), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("status %s", resp.Status)
+	}
+
+	var out subscriptionSummary
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// loadOrgBillingSummary populates billing-related data for the settings template.
+func loadOrgBillingSummary(ctx *context.Context) {
+	ctx.Data["OrgBilling"] = (*organization.OrgBilling)(nil)
+	ctx.Data["BillingSeatCount"] = 0
+	ctx.Data["BillingSubscription"] = nil
+	ctx.Data["BillingCustomerID"] = ""
+	if !isPaywallEnabled() {
+		return
+	}
+
+	ob, err := organization.GetOrgBilling(ctx, ctx.Org.Organization.ID)
+	if err != nil {
+		log.Warn("GetOrgBilling org_id=%d: %v", ctx.Org.Organization.ID, err)
+		return
+	}
+	if ob == nil {
+		return
+	}
+	ctx.Data["OrgBilling"] = ob
+	ctx.Data["BillingCustomerID"] = ob.CustomerID
+
+	memberIDs, err := organization.GetWriteMembersIDs(ctx, ctx.Org.Organization.ID)
+	if err != nil {
+		log.Warn("GetWriteMembersIDs org_id=%d: %v", ctx.Org.Organization.ID, err)
+	} else {
+		ctx.Data["BillingSeatCount"] = len(memberIDs)
+	}
+
+	if ob.SubscriptionID != "" {
+		if sub, err := fetchSubscription(ctx, ob.SubscriptionID); err != nil {
+			log.Warn("fetchSubscription org_id=%d sub_id=%s: %v", ctx.Org.Organization.ID, ob.SubscriptionID, err)
+		} else {
+			ctx.Data["BillingSubscription"] = sub
+			if ctx.Data["BillingCustomerID"] == "" && sub.Customer != "" {
+				ctx.Data["BillingCustomerID"] = sub.Customer
+			}
+		}
+	}
 }
 
 // SettingsAvatar response for change avatar on settings page
