@@ -56,6 +56,39 @@
 
 		<div class="divider"></div>
 
+		<div class="ui form">
+			<div class="field">
+				<label>Billing</label>
+				{{if .OrgBilling}}
+					<div class="ui relaxed list">
+						<div class="item"><strong>Seats (write access):</strong> {{.BillingSeatCount}}</div>
+						<div class="item"><strong>Stripe quantity:</strong> {{if .BillingSubscription}}{{.BillingSubscription.Quantity}}{{else}}Unknown{{end}}</div>
+						<div class="item"><strong>Subscription status:</strong> {{if .BillingSubscription}}{{.BillingSubscription.Status}}{{else}}Unknown{{end}}</div>
+						<div class="item"><strong>Last sync:</strong> {{if .OrgBilling.LastSync}}{{DateUtils.TimeSince .OrgBilling.LastSync.AsTime}}{{else}}Never{{end}}</div>
+					</div>
+				{{else}}
+					<p class="help">No billing record is linked to this organization yet.</p>
+				{{end}}
+			</div>
+
+			<div class="fields">
+				<div class="field">
+					<form action="{{.Link}}/billing/portal" method="post">
+						{{.CsrfTokenHtml}}
+						<button class="ui primary button" type="submit" {{if not .OrgBilling}}disabled{{else if eq .BillingCustomerID ""}}disabled{{end}}>View billing in Stripe</button>
+					</form>
+				</div>
+				<div class="field">
+					<form action="{{.Link}}/sync_seats" method="post">
+						{{.CsrfTokenHtml}}
+						<button class="ui button" type="submit" {{if not .OrgBilling}}disabled{{else if eq .OrgBilling.SubscriptionID ""}}disabled{{end}}>Sync seats</button>
+					</form>
+				</div>
+			</div>
+		</div>
+
+		<div class="divider"></div>
+
 		<form class="ui form" action="{{.Link}}/avatar" method="post" enctype="multipart/form-data">
 			{{.CsrfTokenHtml}}
 			<div class="inline field">

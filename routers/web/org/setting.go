@@ -5,10 +5,14 @@
 package org
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 
 	"code.gitea.io/gitea/models/db"
+	"code.gitea.io/gitea/models/organization"
 	packages_model "code.gitea.io/gitea/models/packages"
 	repo_model "code.gitea.io/gitea/models/repo"
 	user_model "code.gitea.io/gitea/models/user"
@@ -19,6 +23,7 @@ import (
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/templates"
+	"code.gitea.io/gitea/modules/timeutil"
 	"code.gitea.io/gitea/modules/util"
 	"code.gitea.io/gitea/modules/web"
 	shared_user "code.gitea.io/gitea/routers/web/shared/user"
@@ -47,6 +52,8 @@ func Settings(ctx *context.Context) {
 	ctx.Data["RepoAdminChangeTeamAccess"] = ctx.Org.Organization.RepoAdminChangeTeamAccess
 	ctx.Data["ContextUser"] = ctx.ContextUser
 
+	loadOrgBillingSummary(ctx)
+
 	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
 		ctx.ServerError("RenderUserOrgHeader", err)
 		return
@@ -57,6 +64,7 @@ func Settings(ctx *context.Context) {
 
 // SettingsPost response for settings change submitted
 func SettingsPost(ctx *context.Context) {
+	loadOrgBillingSummary(ctx)
 	form := web.GetForm(ctx).(*forms.UpdateOrgSettingForm)
 	ctx.Data["Title"] = ctx.Tr("org.settings")
 	ctx.Data["PageIsOrgSettings"] = true
@@ -97,6 +105,188 @@ func SettingsPost(ctx *context.Context) {
 	log.Trace("Organization setting updated: %s", org.Name)
 	ctx.Flash.Success(ctx.Tr("org.settings.update_setting_success"))
 	ctx.Redirect(ctx.Org.OrgLink + "/settings")
+}
+
+// BillingPortal generates a Stripe customer portal URL and redirects the org owner there.
+func BillingPortal(ctx *context.Context) {
+	org := ctx.Org.Organization
+
+	ob, err := organization.GetOrgBilling(ctx, org.ID)
+	if err != nil {
+		ctx.ServerError("GetOrgBilling", err)
+		return
+	}
+	customerID := ob.CustomerID
+	if customerID == "" && ob.SubscriptionID != "" {
+		if sub, err := fetchSubscription(ctx, ob.SubscriptionID); err == nil && sub != nil && sub.Customer != "" {
+			log.Info("BillingPortal: fetched subscription %s with customer %s for org_id=%d", ob.SubscriptionID, sub.Customer, org.ID)
+			customerID = sub.Customer
+			ob.CustomerID = sub.Customer
+			_ = organization.UpsertOrgBilling(ctx, ob)
+		} else if err != nil {
+			log.Warn("BillingPortal: fetchSubscription failed sub_id=%s org_id=%d: %v", ob.SubscriptionID, org.ID, err)
+		} else {
+			log.Warn("BillingPortal: subscription has no customer sub_id=%s org_id=%d", ob.SubscriptionID, org.ID)
+		}
+	}
+	if customerID == "" {
+		ctx.Flash.Error("No billing customer found for this organization")
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	payload := map[string]string{
+		"customer_id": customerID,
+		"return_url":  fmt.Sprintf("%sorg/%s/settings", setting.AppURL, url.PathEscape(org.Name)),
+	}
+	if ob.SubscriptionID != "" {
+		payload["subscription_id"] = ob.SubscriptionID
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		ctx.ServerError("MarshalPortalPayload", err)
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/billing/portal", paymentsBaseURL()), bytes.NewReader(body))
+	if err != nil {
+		ctx.ServerError("BillingPortalRequest", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		ctx.Flash.Error(fmt.Sprintf("Failed to generate billing portal: %v", err))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		ctx.Flash.Error(fmt.Sprintf("Failed to generate billing portal: %s", resp.Status))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	var out struct {
+		PortalURL string `json:"portal_url"`
+		ID        string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		ctx.Flash.Error(fmt.Sprintf("Failed to parse billing portal response: %v", err))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+	if out.PortalURL == "" {
+		ctx.Flash.Error("Failed to generate billing portal: missing URL")
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	ctx.Redirect(out.PortalURL)
+}
+
+// SyncSeats recomputes billable seats for the org and pushes the quantity to the payments sidecar.
+func SyncSeats(ctx *context.Context) {
+	org := ctx.Org.Organization
+
+	ob, err := organization.GetOrgBilling(ctx, org.ID)
+	if err != nil {
+		ctx.ServerError("GetOrgBilling", err)
+		return
+	}
+	if ob == nil || ob.SubscriptionID == "" {
+		ctx.Flash.Error("No subscription found to sync seats")
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	memberIDs, err := organization.GetWriteMembersIDs(ctx, org.ID)
+	if err != nil {
+		log.Error("GetWriteMembersIDs org_id=%d: %v", org.ID, err)
+		ctx.Flash.Error("Failed to compute seat count")
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+	seatCount := len(memberIDs)
+
+	body, err := json.Marshal(map[string]int{"quantity": seatCount})
+	if err != nil {
+		ctx.ServerError("MarshalSyncSeatsPayload", err)
+		return
+	}
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/billing/subscription/%s/quantity", paymentsBaseURL(), url.PathEscape(ob.SubscriptionID)), bytes.NewReader(body))
+	if err != nil {
+		ctx.ServerError("SyncSeatsRequest", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		ctx.Flash.Error(fmt.Sprintf("Failed to sync seats: %v", err))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		ctx.Flash.Error(fmt.Sprintf("Failed to sync seats: %s", resp.Status))
+		ctx.Redirect(ctx.Org.OrgLink + "/settings")
+		return
+	}
+
+	ob.LastSeatCount = seatCount
+	ob.LastSync = timeutil.TimeStampNow()
+	if err := organization.UpsertOrgBilling(ctx, ob); err != nil {
+		log.Warn("UpsertOrgBilling sync seats org_id=%d: %v", org.ID, err)
+	}
+
+	ctx.Flash.Success(fmt.Sprintf("Synced seats to %d", seatCount))
+	ctx.Redirect(ctx.Org.OrgLink + "/settings")
+}
+
+// loadOrgBillingSummary populates billing-related data for the settings template.
+func loadOrgBillingSummary(ctx *context.Context) {
+	ctx.Data["OrgBilling"] = (*organization.OrgBilling)(nil)
+	ctx.Data["BillingSeatCount"] = 0
+	ctx.Data["BillingSubscription"] = nil
+	ctx.Data["BillingCustomerID"] = ""
+	if !isPaywallEnabled() {
+		return
+	}
+
+	ob, err := organization.GetOrgBilling(ctx, ctx.Org.Organization.ID)
+	if err != nil {
+		log.Warn("GetOrgBilling org_id=%d: %v", ctx.Org.Organization.ID, err)
+		return
+	}
+	if ob == nil {
+		return
+	}
+	ctx.Data["OrgBilling"] = ob
+	ctx.Data["BillingCustomerID"] = ob.CustomerID
+
+	memberIDs, err := organization.GetWriteMembersIDs(ctx, ctx.Org.Organization.ID)
+	if err != nil {
+		log.Warn("GetWriteMembersIDs org_id=%d: %v", ctx.Org.Organization.ID, err)
+	} else {
+		ctx.Data["BillingSeatCount"] = len(memberIDs)
+	}
+
+	if ob.SubscriptionID != "" {
+		if sub, err := fetchSubscription(ctx, ob.SubscriptionID); err != nil {
+			log.Warn("fetchSubscription org_id=%d sub_id=%s: %v", ctx.Org.Organization.ID, ob.SubscriptionID, err)
+		} else {
+			ctx.Data["BillingSubscription"] = sub
+			if ctx.Data["BillingCustomerID"] == "" && sub.Customer != "" {
+				ctx.Data["BillingCustomerID"] = sub.Customer
+			}
+		}
+	}
 }
 
 // SettingsAvatar response for change avatar on settings page

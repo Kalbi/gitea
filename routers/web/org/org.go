@@ -46,9 +46,11 @@ func Create(ctx *context.Context) {
 	ctx.Data["CheckoutURL"] = ""
 	ctx.Data["HasActiveSubscription"] = false
 	ctx.Data["ActiveSubscriptionID"] = ""
+	ctx.Data["ActiveCustomerID"] = ""
 	// NOTE: ctx.Data is where template fetches data; this block is temporary scaffolding.
 	// Eventually push paywall/session state handling into a dedicated helper/service
-	// TODO: Persist stripe ids in db instead of template here using xorm
+	// TODO: add a pending checkout table keyed by CheckoutSessionID (org_name/customer/subscription)
+	// and transfer to OrgBilling after org creation to reduce reliance on session
 
 	// reuse session if present, allow resume
 	sessionID := ctx.FormString("checkout_session_id")
@@ -63,12 +65,14 @@ func Create(ctx *context.Context) {
 		ctx.Data["CheckoutURL"] = checkoutURL
 	}
 	if subID, ok := ctx.Session.Get("subscription_id").(string); ok && subID != "" {
-		ctx.Data["HasActiveSubscription"] = true
 		ctx.Data["ActiveSubscriptionID"] = subID
+	}
+	if custID, ok := ctx.Session.Get("customer_id").(string); ok && custID != "" {
+		ctx.Data["ActiveCustomerID"] = custID
 	}
 
 	if sessionID != "" {
-		status, paid, subID := fetchCheckoutStatus(ctx, sessionID)
+		status, paid, subID, custID := fetchCheckoutStatus(ctx, sessionID)
 		ctx.Data["CheckoutStatus"] = status
 		if paid {
 			ctx.Data["PaymentCompleted"] = true
@@ -76,8 +80,13 @@ func Create(ctx *context.Context) {
 			ctx.Data["HasActiveSubscription"] = true
 			ctx.Data["ActiveSubscriptionID"] = subID
 			ctx.Session.Set("subscription_id", subID)
+			if custID != "" {
+				ctx.Data["ActiveCustomerID"] = custID
+				ctx.Session.Set("customer_id", custID)
+			}
 		} else {
 			ctx.Data["billing_token"] = sessionID
+			ctx.Data["HasActiveSubscription"] = false
 		}
 	}
 	if orgName := ctx.FormString("org_name"); orgName != "" {
@@ -96,9 +105,14 @@ func CreatePost(ctx *context.Context) {
 	ctx.Data["org_name"] = form.OrgName
 	ctx.Data["visibility"] = form.Visibility
 	ctx.Data["repo_admin_change_team_access"] = form.RepoAdminChangeTeamAccess
+	ctx.Data["HasActiveSubscription"] = false
+	ctx.Data["ActiveCustomerID"] = ""
 	if subID, ok := ctx.Session.Get("subscription_id").(string); ok && subID != "" {
 		ctx.Data["HasActiveSubscription"] = true
 		ctx.Data["ActiveSubscriptionID"] = subID
+	}
+	if custID, ok := ctx.Session.Get("customer_id").(string); ok && custID != "" {
+		ctx.Data["ActiveCustomerID"] = custID
 	}
 
 	if !ctx.Doer.CanCreateOrganization() {
@@ -111,12 +125,17 @@ func CreatePost(ctx *context.Context) {
 		return
 	}
 
-	hasSub := ctx.Data["HasActiveSubscription"].(bool)
+	hasSub := false
+	if v, ok := ctx.Data["HasActiveSubscription"].(bool); ok {
+		hasSub = v
+	}
 
 	if isPaywallEnabled() && ctx.Req.FormValue("generate_checkout") == "1" {
 		checkoutURL, err := createCheckoutForOrg(ctx, &form)
 		if err != nil {
-			ctx.ServerError("CreateCheckoutSession", err)
+			log.Warn("CreateCheckoutSession failed: %v", err)
+			ctx.Flash.Error(ctx.Tr("org.form.payment_generate_failed"))
+			ctx.Redirect(ctx.Link)
 			return
 		}
 		ctx.Redirect(checkoutURL)
@@ -156,6 +175,21 @@ func CreatePost(ctx *context.Context) {
 	}
 	log.Trace("Organization created: %s", org.Name)
 
+	// Persist billing linkage if present
+	if isPaywallEnabled() {
+		subID, _ := ctx.Data["ActiveSubscriptionID"].(string)
+		sessionID, _ := ctx.Data["billing_token"].(string)
+		custID, _ := ctx.Data["ActiveCustomerID"].(string)
+		if subID != "" || sessionID != "" {
+			_ = organization.UpsertOrgBilling(ctx, &organization.OrgBilling{
+				OrgID:             org.ID,
+				SubscriptionID:    subID,
+				CustomerID:        custID,
+				CheckoutSessionID: sessionID,
+			})
+		}
+	}
+
 	ctx.Redirect(org.AsUser().DashboardLink())
 }
 
@@ -184,32 +218,63 @@ type checkoutStatus struct {
 	ExpiresAt      int64  `json:"expires_at"`
 }
 
-func fetchCheckoutStatus(ctx *context.Context, sessionID string) (string, bool, string) {
+type subscriptionSummary struct {
+	ID               string `json:"id"`
+	Status           string `json:"status"`
+	Quantity         int    `json:"quantity"`
+	Customer         string `json:"customer"`
+	CurrentPeriodEnd int64  `json:"current_period_end"`
+}
+
+func fetchCheckoutStatus(ctx *context.Context, sessionID string) (string, bool, string, string) {
 	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/billing/session/%s", paymentsBaseURL(), url.PathEscape(sessionID)), nil)
 	if err != nil {
 		log.Warn("checkout status request build failed: %v", err)
-		return err.Error(), false, ""
+		return err.Error(), false, "", ""
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Warn("checkout status request error: %v", err)
-		return err.Error(), false, ""
+		return err.Error(), false, "", ""
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= http.StatusBadRequest {
 		log.Warn("checkout status http error: %s", resp.Status)
-		return fmt.Sprintf("status %s", resp.Status), false, ""
+		return fmt.Sprintf("status %s", resp.Status), false, "", ""
 	}
 
 	var st checkoutStatus
 	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
 		log.Warn("checkout status decode error: %v", err)
-		return err.Error(), false, ""
+		return err.Error(), false, "", ""
 	}
 	paid := st.Status == "complete" || st.PaymentStatus == "paid"
 	log.Info("checkout status: paid=%v session=%s status=%s payment_status=%s customer=%s subscription=%s", paid, st.SessionID, st.Status, st.PaymentStatus, st.CustomerID, st.SubscriptionID)
-	return fmt.Sprintf("%s/%s", st.Status, st.PaymentStatus), paid, st.SubscriptionID
+	return fmt.Sprintf("%s/%s", st.Status, st.PaymentStatus), paid, st.SubscriptionID, st.CustomerID
+}
+
+func fetchSubscription(ctx *context.Context, subscriptionID string) (*subscriptionSummary, error) {
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/billing/subscription/%s", paymentsBaseURL(), url.PathEscape(subscriptionID)), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("status %s", resp.Status)
+	}
+
+	var out subscriptionSummary
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 func createCheckoutForOrg(ctx *context.Context, form *forms.CreateOrgForm) (string, error) {
@@ -255,6 +320,9 @@ func createCheckoutForOrg(ctx *context.Context, form *forms.CreateOrgForm) (stri
 	// Prefill billing token for return flows
 	ctx.Session.Set("checkout_session_id", out.SessionID)
 	ctx.Session.Set("checkout_url", out.CheckoutURL)
+	if out.CustomerID != "" {
+		ctx.Session.Set("customer_id", out.CustomerID)
+	}
 	ctx.Data["billing_token"] = out.SessionID
 	return out.CheckoutURL, nil
 }
