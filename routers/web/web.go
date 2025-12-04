@@ -965,6 +965,7 @@ func registerWebRoutes(m *web.Router) {
 					addSettingsVariablesRoutes()
 				}, actions.MustEnableActions)
 
+				m.Post("/billing/portal", org.BillingPortal)
 				m.Post("/sync_seats", org.SyncSeats)
 				m.Post("/rename", web.Bind(forms.RenameOrgForm{}), org.SettingsRenamePost)
 				m.Post("/delete", org.SettingsDeleteOrgPost)
