@@ -56,6 +56,17 @@
 
 		<div class="divider"></div>
 
+		<form class="ui form" action="{{.Link}}/sync_seats" method="post">
+			{{.CsrfTokenHtml}}
+			<div class="field">
+				<label>Billing</label>
+				<p class="help">Manually sync write-access members to the subscription quantity.</p>
+				<button class="ui button" type="submit">Sync seats</button>
+			</div>
+		</form>
+
+		<div class="divider"></div>
+
 		<form class="ui form" action="{{.Link}}/avatar" method="post" enctype="multipart/form-data">
 			{{.CsrfTokenHtml}}
 			<div class="inline field">
