@@ -48,7 +48,7 @@ func Create(ctx *context.Context) {
 	ctx.Data["ActiveSubscriptionID"] = ""
 	// NOTE: ctx.Data is where template fetches data; this block is temporary scaffolding.
 	// Eventually push paywall/session state handling into a dedicated helper/service
-	// TODO: Persist stripe ids in db instead of template here using xorm
+	// TODO: load persisted billing info (OrgBilling) and reduce reliance on session
 
 	// reuse session if present, allow resume
 	sessionID := ctx.FormString("checkout_session_id")
@@ -155,6 +155,19 @@ func CreatePost(ctx *context.Context) {
 		return
 	}
 	log.Trace("Organization created: %s", org.Name)
+
+	// Persist billing linkage if present
+	if isPaywallEnabled() {
+		subID, _ := ctx.Data["ActiveSubscriptionID"].(string)
+		sessionID, _ := ctx.Data["billing_token"].(string)
+		if subID != "" || sessionID != "" {
+			_ = organization.UpsertOrgBilling(ctx, &organization.OrgBilling{
+				OrgID:             org.ID,
+				SubscriptionID:    subID,
+				CheckoutSessionID: sessionID,
+			})
+		}
+	}
 
 	ctx.Redirect(org.AsUser().DashboardLink())
 }
